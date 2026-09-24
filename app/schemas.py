@@ -5,7 +5,13 @@ from __future__ import annotations
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .greenwave import MAX_CYCLE, MAX_INTERSECTIONS, MAX_OBSERVATIONS, MAX_WINDOW_SECONDS
+from .greenwave import (
+    MAX_CONVOY_VEHICLES,
+    MAX_CYCLE,
+    MAX_INTERSECTIONS,
+    MAX_OBSERVATIONS,
+    MAX_WINDOW_SECONDS,
+)
 
 
 class Intersection(BaseModel):
@@ -242,3 +248,30 @@ class SlotOffsetsResponse(BaseModel):
             "较小者；无可行值时为 null"
         ),
     )
+
+
+class ConvoyStartsRequest(GreenWaveRequest):
+    """车队首车发车窗口请求：在绿波请求基础上增加车队规模与发车间隔。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    vehicle_count: int = Field(
+        ..., ge=2, le=MAX_CONVOY_VEHICLES,
+        description="车队车辆数 n，2..50；首车之后还有 n-1 辆车依次发车",
+    )
+    headway: int = Field(
+        ..., ge=1, le=MAX_WINDOW_SECONDS,
+        description="相邻车辆的发车间隔 h（秒，正整数）；第 k 辆在首车之后 k*h 秒出发",
+    )
+
+    def validate_ranges(self) -> None:
+        """复用全部绿波 422 校验，并要求车队首尾跨度小于发车范围长度。"""
+        super().validate_ranges()
+        span = (self.vehicle_count - 1) * self.headway
+        if span >= self.depart_to - self.depart_from:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    "(vehicle_count - 1) × headway 必须小于发车范围长度"
+                ],
+            )

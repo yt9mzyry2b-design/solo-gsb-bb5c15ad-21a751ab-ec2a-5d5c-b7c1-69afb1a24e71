@@ -5,12 +5,14 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .greenwave import (
+    compute_convoy_starts,
     compute_max_coverage,
     compute_slot_offsets,
     compute_windows,
     offset_diagnostics,
 )
 from .schemas import (
+    ConvoyStartsRequest,
     GreenWaveRequest,
     MaxCoverageResponse,
     OffsetDiagnosticsRequest,
@@ -43,9 +45,15 @@ app = FastAPI(
         "整数秒都能发车（其余路口保持原 offset、各路口均须对 travel 到 "
         "travel_max 的任意实际行驶时间遇绿）的全部可行整数 offset（按极大"
         "半开区间输出，跨零点分段），并给出距原 offset 环形最近的建议值"
-        "（等距取较小者，无可行值为 null）。"
+        "（等距取较小者，无可行值为 null）。\n\n"
+        "车队接口 `POST /api/green-wave/convoy-starts`：复用路口参数与发车"
+        "范围，另传 vehicle_count（2..50）与 headway（正整数秒，要求 "
+        "(vehicle_count-1)×headway 小于范围长度）。车队按固定间隔发车，"
+        "每辆车都在给定范围内且在每个路口对任意实际行驶时间遇绿；基于单车"
+        "可行窗口平移、求交并合并相邻区间（不只检查首末车），返回全部极大"
+        "半开首车发车区间，无解时返回空数组。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -159,3 +167,23 @@ def green_wave_slot_offsets(
         ],
         recommended_offset=recommended,
     )
+
+
+@app.post(
+    "/api/green-wave/convoy-starts",
+    response_model=list[Window],
+    tags=["绿波"],
+    summary="计算车队首车发车的全部极大半开区间",
+)
+def green_wave_convoy_starts(request: ConvoyStartsRequest) -> list[Window]:
+    request.validate_ranges()
+    starts = compute_convoy_starts(
+        intersections=[
+            _intersection_payload(item) for item in request.intersections
+        ],
+        depart_from=request.depart_from,
+        depart_to=request.depart_to,
+        vehicle_count=request.vehicle_count,
+        headway=request.headway,
+    )
+    return [Window(start=start, end=end) for start, end in starts]

@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供四个接口：
+提供五个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -27,6 +27,14 @@
    可调路口的**全部可行整数** `offset ∈ [0, cycle)`（按极大半开区间输出，跨零点在
    `[0, cycle)` 内分段）以及**距原 offset 环形距离最小**的建议值（正反向等距时取较小
    offset；无可行值时为 `null`）。
+5. **车队首车发车窗口** `POST /api/green-wave/convoy-starts`：复用绿波窗口接口的全部
+   路口参数与发车范围，另传 `vehicle_count`（车队车辆数 `2..50`）与 `headway`
+   （相邻车辆发车间隔，正整数秒），并要求 `(vehicle_count-1)×headway` **小于**发车范围
+   长度。车队按固定间隔依次发车：首车时刻为 `t` 时第 `k` 辆在 `t + k×headway` 出发，
+   要求**每辆车**都落在发车范围内，且每辆车在**每个**路口对 `travel` 到 `travel_max`
+   的**任意实际行驶时间**均遇绿。服务基于单车可行窗口**平移、求交并合并相邻区间**
+   （中间车辆同样检查，不只验首末车），返回**全部极大半开首车发车区间**，按起点升序；
+   无解时返回空数组 `[]`。
 
 ## 目录结构
 
@@ -89,6 +97,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 最大绿波覆盖 | `POST http://localhost:8000/api/green-wave/max-coverage` |
 | 单路口 offset 诊断 | `POST http://localhost:8000/api/green-wave/offset-diagnostics` |
 | 整段时隙可调 offset | `POST http://localhost:8000/api/green-wave/slot-offsets` |
+| 车队首车发车窗口 | `POST http://localhost:8000/api/green-wave/convoy-starts` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -611,6 +620,93 @@ curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
 全程仅做常数次区间运算（固定路口的窗口数同 `/windows`），与周期大小、范围长度无关；
 测试含 3000 组随机参数下与逐 offset × 逐秒暴力实现的逐项对照（可行区间与建议值）。
 
+## 车队首车发车窗口
+
+`POST /api/green-wave/convoy-starts` 用于编队（convoy）出行：一个车队的全部车辆以
+**固定间隔**依次发车，求首车可以在哪些时刻出发，才能让**每辆车**都在发车范围内、
+且在**每个**路口对 `[travel, travel_max]` 内**任意实际行驶时间**都遇绿。请求体与
+`/windows` 完全相同（同样的发车范围、1..8 个路口参数与 422 校验规则），仅额外增加：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `vehicle_count` | int | `2..50`，车队车辆数 n |
+| `headway` | int | `>= 1`，相邻车辆发车间隔 h（秒，正整数） |
+| （跨字段） | | `(vehicle_count-1)×headway` 必须**小于**发车范围长度，否则 422 |
+
+首车时刻为 `t` 时，第 `k` 辆车（`k = 0..n-1`）在 `t + k×headway` 出发。首车时刻
+可行，当且仅当：**每辆车的出发时刻都在 `[depart_from, depart_to)` 内**（等价于
+`t ∈ [depart_from, depart_to - (n-1)×headway)`），且每辆车在每个路口都满足与
+`/windows` 完全一致的单车可行条件（跨周期绿灯先连续化再收缩、常绿不收缩、半开
+边界等语义全部沿用）。
+
+响应为**全部极大半开首车发车区间** `[start, end)`（按起点升序），与 `/windows`
+同为窗口数组；无解时返回空数组 `[]`：
+
+```json
+[{"start": 0, "end": 20}, {"start": 60, "end": 80}]
+```
+
+### 示例 1：两路口绿波带上的 2 辆编队
+
+沿用 `/windows` 示例 1 的两个路口（周期 60 秒、绿灯 `[0,30)`、下游 offset 恰好
+补偿 30 秒行程），2 辆车间隔 10 秒发车：首车 `t` 与第二辆车 `t+10` 必须同落某个
+`[60q, 60q+30)`，故每周期 30 秒的单车窗口收缩为 20 秒：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/convoy-starts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 300,
+    "vehicle_count": 2,
+    "headway": 10,
+    "intersections": [
+      {"cycle": 60, "offset": 0,  "green_start": 0, "green_end": 30, "travel": 0},
+      {"cycle": 60, "offset": 30, "green_start": 0, "green_end": 30, "travel": 30}
+    ]
+  }'
+```
+
+响应：
+
+```json
+[{"start":0,"end":20},{"start":60,"end":80},{"start":120,"end":140},
+ {"start":180,"end":200},{"start":240,"end":260}]
+```
+
+### 示例 2：中间车辆被红灯卡住（不能只检查首末车）
+
+绿灯 `[0,30)`、3 辆车间隔 40 秒：首车 `t ∈ [0,10)` 时首车（`t`）与末车
+（`t+80`，相位 20..30 内）都遇绿，但第 2 辆车在 `t+40 ∈ [40,50)` 必遇红灯——
+只验首末车会误判可行，正确结果是无解：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/convoy-starts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 120,
+    "vehicle_count": 3,
+    "headway": 40,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0}
+    ]
+  }'
+# []
+```
+
+### 车队窗口的算法说明（单车窗口平移求交，不逐秒试探）
+
+1. **复用单车可行窗口**：对每个路口先计算与 `/windows` 完全相同的单车可行窗口
+   （跨周期绿灯先连续化再收缩、常绿不收缩、半开边界裁剪）；
+2. **按车间隔平移求交**：第 `k` 辆车在 `t + k×h` 出发，等价于首车时刻 `t` 落在
+   单车窗口整体**左移 `k×h`** 后的集合中。逐路口把 `k = 0..n-1` 的 n 份平移窗口
+   **全部**求交——中间车辆同样检查，只验首末车会漏掉恰好卡住中间车辆的绿灯间隙
+   （见示例 2）——再跨路口求交；
+3. **裁剪首车范围并合并**：把结果裁剪进首车范围
+   `[depart_from, depart_to - (n-1)×headway)`，合并相邻（端点相接）区间，即得全部
+   极大半开首车发车区间。全程只做区间平移与求交，不逐秒试探。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -644,6 +740,14 @@ curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
 { "detail": ["green_end 必须满足 0 <= green_end < cycle"] }
 ```
 
+`/api/green-wave/convoy-starts` 同样沿用绿波窗口接口的**全部** 422 校验，并额外
+要求 `vehicle_count ∈ [2, 50]`、`headway >= 1`（字段级 422），以及
+`(vehicle_count-1)×headway` **小于**发车范围长度（否则首车不存在任何可行时刻）：
+
+```json
+{ "detail": ["(vehicle_count - 1) × headway 必须小于发车范围长度"] }
+```
+
 ## 算法说明（区间运算，不逐秒试探）
 
 1. **周期内展开与波动收缩**：每个路口的绿灯半开区间先展开为连续分量
@@ -665,6 +769,11 @@ curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
 `/api/green-wave/max-coverage` 复用第 1、2 步得到的各路口可行窗口，再在窗口端点
 放置差分事件做一次扫描（至多 `8 × 2 × 3600` 个事件），复杂度与窗口接口同阶。
 
+`/api/green-wave/convoy-starts` 同样复用第 1、2 步的单车可行窗口：第 `k` 辆车
+（`k = 0..n-1`）在首车之后 `k×headway` 秒出发，等价于把单车窗口整体左移 `k×headway`
+后求交；逐路口完成 n 份平移窗口的求交后再跨路口求交，最后裁剪进首车范围并合并
+相邻区间，复杂度约为 `O(路口数 × 车辆数 × 每路口窗口数)` 次区间运算。
+
 ## 运行测试
 
 ```bash
@@ -680,4 +789,7 @@ pytest -q
 负到达时刻、周期 1 秒及 2000 条观测的性能用例；整段时隙可调 offset
 另有 3000 组随机参数下与逐 offset × 逐秒暴力实现的对照（可行区间与环形最近
 建议值），并覆盖跨零点分段、常绿、波动收缩后弧长不足、范围不短于周期、
-固定路口无法覆盖整段及等距建议取较小 offset 等边界。
+固定路口无法覆盖整段及等距建议取较小 offset 等边界；车队首车发车窗口
+另有 3000 组随机参数下与逐首车时刻 × 逐车暴力参考实现的逐项对照，并覆盖
+中间车辆被绿灯间隙卡住（不能只验首末车）、跨零点绿灯、行驶时间波动、
+首车范围裁剪与半开边界、常绿及无解等场景。

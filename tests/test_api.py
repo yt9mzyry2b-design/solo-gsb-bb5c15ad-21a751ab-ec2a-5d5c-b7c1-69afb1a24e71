@@ -3,12 +3,14 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.main import (
+    green_wave_convoy_starts,
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
     green_wave_slot_offsets,
     green_wave_windows,
 )
 from app.schemas import (
+    ConvoyStartsRequest,
     GreenWaveRequest,
     Intersection,
     OffsetDiagnosticsRequest,
@@ -586,3 +588,139 @@ def test_slot_offsets_route_is_in_openapi():
     paths = app.openapi()["paths"]
     assert "/api/green-wave/slot-offsets" in paths
     assert "post" in paths["/api/green-wave/slot-offsets"]
+
+
+# ---------- POST /api/green-wave/convoy-starts ----------
+
+def make_convoy_request(payload):
+    return ConvoyStartsRequest.model_validate(payload)
+
+
+def test_convoy_starts_payload():
+    # 两路口绿波带，2 辆车间隔 10 秒：首车窗口由 30 秒收缩为 20 秒
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 300,
+            "vehicle_count": 2,
+            "headway": 10,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0},
+                {"cycle": 60, "offset": 30, "green_start": 0, "green_end": 30, "travel": 30},
+            ],
+        }
+    )
+    starts = green_wave_convoy_starts(req)
+    assert [[w.start, w.end] for w in starts] == [
+        [0, 20], [60, 80], [120, 140], [180, 200], [240, 260],
+    ]
+
+
+def test_convoy_starts_empty_array_on_no_solution():
+    # 3 辆车间隔 40 秒：首末车检查会误判可行，中间车必卡红灯，返回空数组
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 120,
+            "vehicle_count": 3,
+            "headway": 40,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    assert green_wave_convoy_starts(req) == []
+
+
+def test_convoy_rejects_vehicle_count_out_of_range():
+    for count in (1, 51):
+        with pytest.raises(ValidationError):
+            make_convoy_request(
+                {
+                    "depart_from": 0,
+                    "depart_to": 300,
+                    "vehicle_count": count,
+                    "headway": 5,
+                    "intersections": [
+                        {"cycle": 60, "offset": 0, "green_start": 0,
+                         "green_end": 30, "travel": 0}
+                    ],
+                }
+            )
+
+
+def test_convoy_rejects_non_positive_headway():
+    with pytest.raises(ValidationError):
+        make_convoy_request(
+            {
+                "depart_from": 0,
+                "depart_to": 300,
+                "vehicle_count": 2,
+                "headway": 0,
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0}
+                ],
+            }
+        )
+
+
+def test_convoy_rejects_span_not_less_than_range():
+    # (3-1)×10 = 20 不小于范围长度 20：首车不存在可行时刻，422
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 20,
+            "vehicle_count": 3,
+            "headway": 10,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_convoy_starts(req)
+    assert exc.value.status_code == 422
+
+
+def test_convoy_span_one_less_than_range_accepted():
+    # (3-1)×9 = 18 < 20：常绿路口下首车范围为 [0, 2)
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 20,
+            "vehicle_count": 3,
+            "headway": 9,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 0, "travel": 0}
+            ],
+        }
+    )
+    starts = green_wave_convoy_starts(req)
+    assert [[w.start, w.end] for w in starts] == [[0, 2]]
+
+
+def test_convoy_reuses_green_wave_validation():
+    # 与 /windows 相同的跨字段校验：发车范围超过 3600 秒仍返回 422。
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "vehicle_count": 2,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_convoy_starts(req)
+    assert exc.value.status_code == 422
+
+
+def test_convoy_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/convoy-starts" in paths
+    assert "post" in paths["/api/green-wave/convoy-starts"]
