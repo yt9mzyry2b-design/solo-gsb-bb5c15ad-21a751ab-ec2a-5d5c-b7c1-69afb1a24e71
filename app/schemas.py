@@ -108,6 +108,33 @@ class GreenWaveRequest(BaseModel):
             raise HTTPException(status_code=422, detail=errors)
 
 
+class ConvoyStartsRequest(GreenWaveRequest):
+    """固定间隔车队首车发车区间请求：在绿波请求基础上增加车辆数与发车间隔。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    vehicle_count: int = Field(
+        ..., ge=2, le=50, description="车队车辆数（含首车），2..50"
+    )
+    headway: int = Field(
+        ..., ge=1, le=MAX_WINDOW_SECONDS,
+        description="相邻车辆固定发车间隔（正整数秒）",
+    )
+
+    def validate_ranges(self) -> None:
+        """复用全部绿波 422 校验，并额外校验车队总跨度小于发车范围长度。"""
+        super().validate_ranges()
+        span = (self.vehicle_count - 1) * self.headway
+        if span >= self.depart_to - self.depart_from:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    "(vehicle_count-1) × headway 必须严格小于发车范围长度"
+                    "（depart_to - depart_from），以保证末车也在发车范围内"
+                ],
+            )
+
+
 class Window(BaseModel):
     """一个极大半开发车区间 [start, end)。"""
 

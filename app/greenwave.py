@@ -54,8 +54,22 @@
 n 个连续点 ``[lo+shift, hi+shift) mod C``；它们整体落入弧 E，当且仅当
 ``L >= n``，且 shift 可取一段长 ``M = L - n + 1`` 的连续闭整数弧（半开表示
 为 ``[r0, r0+M) mod C``，``r0 = (e0 - lo) mod C``）。offset 弧由其整体旋转
-``-T`` 得到，跨零点时在 ``[0, C)`` 内分两段。``L >= C``（整圆常绿）时每个
-offset 都可行；``L < n``（含 n >= C 而非常绿）时可行集为空。
+``-T`` 得到，跨零点时在 ``[0, C)`` 内分两段。固定间隔车队
+--------------
+:func:`compute_convoy_starts` 复用**单路口可行窗口**：车队共 n 辆车，首车
+在 t 出发，其后每隔 h（headway，正整数秒）发一辆，即第 j 辆车在
+``t + j*h`` 出发（j = 0..n-1）。要求所有车辆都在给定发车范围
+``[depart_from, depart_to)`` 内，故首车取值范围为
+``[depart_from, depart_to - (n-1)*h)``（调用方保证 ``(n-1)*h`` 严格小于
+范围长度）；且每辆车在每个路口对 ``travel ~ travel_max`` 的任意实际行驶
+时间都遇绿。
+
+第 j 辆车可行 ⇔ 首车时刻 ``t ∈ W_i - j*h``，W_i 即
+:func:`departure_windows_for_intersection` 给出的单车可行窗口（跨周期绿灯、
+波动收缩、半开边界语义完全一致），把 W_i 整体左移 ``j*h`` 即可，无需为每
+辆车重算信号灯。对全部路口 × 全部 n 辆车的平移窗口逐一双指针求交——**不能
+只查首车（j=0）与末车（j=n-1）**，中间车辆可能恰好落入红灯——最后再合并
+一次相邻区间，即得全部极大半开首车发车区间。
 """
 
 from __future__ import annotations
@@ -237,6 +251,61 @@ def compute_windows(
             return []
     # 求交不会产生相接区间，最后再合并一次以策安全。
     return merge_intervals(common or [])
+
+
+def compute_convoy_starts(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+    vehicle_count: int,
+    headway: int,
+) -> list[Interval]:
+    """求固定间隔车队的全部极大半开**首车**发车区间，按起点排序。
+
+    车队共 ``vehicle_count`` 辆车，首车在 t 出发，其后每隔 ``headway``
+    （正整数秒）发一辆，即第 j 辆车（j = 0..vehicle_count-1）在
+    ``t + j*headway`` 出发。要求：
+
+    * 每辆车都在发车范围 ``[depart_from, depart_to)`` 内出发——首车只能取
+      ``[depart_from, depart_to - (vehicle_count-1)*headway)``，调用方已保证
+      ``(vehicle_count-1)*headway < depart_to - depart_from``，故该段非空；
+    * 每辆车在每个路口对 ``[travel, travel_max]`` 内任意实际行驶时间均遇绿。
+
+    复用 :func:`departure_windows_for_intersection` 得到每个路口的单车可行
+    窗口 W_i（跨周期绿灯、先连续再收缩、常绿、半开裁剪等语义不变）；第 j
+    辆车可行当且仅当 ``t + j*headway ∈ W_i``，即 t 属于 W_i 整体左移
+    ``j*headway`` 后的区间。对全部路口 × 全部车辆的平移窗口两两求交——
+    **不能只检查首车与末车**，中间车辆可能恰好压到红灯——交集再裁剪进首车
+    取值范围并合并相邻（端点相接）区间。全程只做区间运算，不逐秒试探。
+    """
+    convoy_span = (vehicle_count - 1) * headway
+    first_from = depart_from
+    first_to = depart_to - convoy_span
+    if first_to <= first_from:
+        return []
+
+    common: list[Interval] = [[first_from, first_to]]
+    for item in intersections:
+        windows = departure_windows_for_intersection(
+            cycle=item["cycle"],
+            offset=item["offset"],
+            green_start=item["green_start"],
+            green_end=item["green_end"],
+            travel=item["travel"],
+            travel_max=item.get("travel_max"),
+            depart_from=depart_from,
+            depart_to=depart_to,
+        )
+        for j in range(vehicle_count):
+            shift = j * headway
+            shifted = [
+                [start - shift, end - shift] for start, end in windows
+            ]
+            common = intersect_interval_lists(common, shifted)
+            if not common:
+                return []
+    # 求交不会产生相接区间，最后再合并一次以策安全。
+    return merge_intervals(common)
 
 
 def compute_max_coverage(

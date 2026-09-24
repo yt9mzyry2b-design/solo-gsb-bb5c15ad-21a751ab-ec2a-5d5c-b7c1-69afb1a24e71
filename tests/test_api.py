@@ -3,12 +3,14 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.main import (
+    green_wave_convoy_starts,
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
     green_wave_slot_offsets,
     green_wave_windows,
 )
 from app.schemas import (
+    ConvoyStartsRequest,
     GreenWaveRequest,
     Intersection,
     OffsetDiagnosticsRequest,
@@ -207,8 +209,193 @@ def test_travel_max_86400_boundary_accepted():
     assert [[w.start, w.end] for w in windows] == [[0, 60]]
 
 
-# ---------- POST /api/green-wave/max-coverage ----------
+# ---------- POST /api/green-wave/convoy-starts ----------
 
+def make_convoy_request(payload):
+    return ConvoyStartsRequest.model_validate(payload)
+
+
+def test_convoy_starts_payload_basic():
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 220,
+            "vehicle_count": 3,
+            "headway": 10,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    windows = green_wave_convoy_starts(req)
+    assert [[w.start, w.end] for w in windows] == [
+        [0, 10], [60, 70], [120, 130], [180, 190],
+    ]
+
+
+def test_convoy_starts_empty_array_on_no_solution():
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "vehicle_count": 3,
+            "headway": 7,
+            "intersections": [
+                {"cycle": 20, "offset": 0, "green_start": 0,
+                 "green_end": 8, "travel": 0}
+            ],
+        }
+    )
+    assert green_wave_convoy_starts(req) == []
+
+
+def test_convoy_starts_rejects_vehicle_count_below_two():
+    with pytest.raises(ValidationError):
+        make_convoy_request(
+            {
+                "depart_from": 0,
+                "depart_to": 60,
+                "vehicle_count": 1,
+                "headway": 5,
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0}
+                ],
+            }
+        )
+
+
+def test_convoy_starts_rejects_vehicle_count_over_fifty():
+    with pytest.raises(ValidationError):
+        make_convoy_request(
+            {
+                "depart_from": 0,
+                "depart_to": 300,
+                "vehicle_count": 51,
+                "headway": 5,
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0}
+                ],
+            }
+        )
+
+
+def test_convoy_starts_rejects_non_positive_headway():
+    with pytest.raises(ValidationError):
+        make_convoy_request(
+            {
+                "depart_from": 0,
+                "depart_to": 60,
+                "vehicle_count": 3,
+                "headway": 0,
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0}
+                ],
+            }
+        )
+
+
+def test_convoy_starts_rejects_span_not_less_than_range_length():
+    # (3-1)*10 = 20 == 范围长度 20：必须严格小于，返回 422。
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 20,
+            "vehicle_count": 3,
+            "headway": 10,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_convoy_starts(req)
+    assert exc.value.status_code == 422
+
+    # 跨度大于范围长度同样 422。
+    req2 = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 15,
+            "vehicle_count": 3,
+            "headway": 10,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_convoy_starts(req2)
+    assert exc.value.status_code == 422
+
+
+def test_convoy_starts_accepts_span_one_second_inside_range():
+    # (2-1)*1 = 1 < 范围长度 2：边界合法，常绿灯下首车可取 [0,1)。
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 2,
+            "vehicle_count": 2,
+            "headway": 1,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0}
+            ],
+        }
+    )
+    windows = green_wave_convoy_starts(req)
+    assert [[w.start, w.end] for w in windows] == [[0, 1]]
+
+
+def test_convoy_starts_reuses_green_wave_validation():
+    # 与 /windows 相同的跨字段校验：offset 越界与范围过长均 422。
+    req = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "vehicle_count": 2,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 60, "green_start": 0,
+                 "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_convoy_starts(req)
+    assert exc.value.status_code == 422
+
+    req2 = make_convoy_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "vehicle_count": 2,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_convoy_starts(req2)
+    assert exc.value.status_code == 422
+
+
+def test_convoy_starts_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/convoy-starts" in paths
+    assert "post" in paths["/api/green-wave/convoy-starts"]
+
+
+# ---------- POST /api/green-wave/max-coverage ----------
 def test_max_coverage_payload_overlap():
     req = make_request(
         {
